@@ -1,0 +1,110 @@
+---
+title: "ML-Safe Anonymization with safetrain"
+author: "safetrain"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{ML-Safe Anonymization}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(safetrain)
+```
+
+## Overview
+
+**safetrain** provides reversible, key-based anonymization of tabular data.
+All columns are encoded to numeric and transformed jointly via a
+key-derived orthogonal rotation. The rotation matrix and centering/scaling
+parameters are derived from the secret key and are **not** stored in the
+mapping, so reversal is only possible with the correct key.
+
+When two or more columns are anonymized, the last rotated column is dropped
+and encrypted, producing an output data frame with one fewer column. This
+means the anonymized data cannot be trivially mapped back to the original
+even if the mapping is leaked -- the key is required.
+
+## Quick start
+
+```{r quick}
+# Generate a secret key (or use a passphrase with key_from_passphrase())
+key <- generate_key()
+
+# Anonymize a data frame
+data(sample_data)
+res <- anonymize_data(sample_data, key)
+anon <- res$data
+mapping <- res$mapping
+
+# Anonymized output has one fewer column, with generic names
+cat("Original columns:", ncol(sample_data), "\n")
+cat("Anonymized columns:", ncol(anon), "\n")
+head(anon)
+```
+
+## Reversing anonymization
+
+Only with the same key and the mapping object can you recover the original data:
+
+```{r reverse}
+back <- deanonymize_data(anon, key, mapping)
+# Round-trip recovers originals (within floating-point tolerance for numerics)
+all(back$user_id == sample_data$user_id)
+all(back$region == sample_data$region)
+all(abs(back$amount - sample_data$amount) < 1e-8)
+```
+
+## Anonymizing a subset of columns
+
+```{r subset}
+res2 <- anonymize_data(sample_data, key, columns = c("user_id", "region"))
+# Only user_id and region are anonymized; others unchanged
+identical(res2$data$product, sample_data$product)
+```
+
+## Model performance on deanonymized data
+
+Because deanonymization exactly recovers the original data, a model trained
+on deanonymized data achieves identical performance to one trained on the
+original. This verifies the round-trip fidelity.
+
+```{r model-perf, eval = requireNamespace("ranger", quietly = TRUE)}
+if (requireNamespace("ranger", quietly = TRUE)) {
+  set.seed(42)
+  n <- nrow(sample_data)
+  idx <- sample(n, floor(0.7 * n))
+  train_orig <- sample_data[idx, ]
+  test_orig <- sample_data[-idx, ]
+
+  key <- generate_key()
+  anon <- anonymize_data(train_orig, key)
+  train_recovered <- deanonymize_data(anon$data, key, anon$mapping)
+
+  m_orig <- ranger::ranger(amount ~ region + product + count, data = train_orig)
+  m_recovered <- ranger::ranger(amount ~ region + product + count, data = train_recovered)
+
+  pred_orig <- predict(m_orig, test_orig)$predictions
+  pred_recovered <- predict(m_recovered, test_orig)$predictions
+
+  rmse_orig <- sqrt(mean((pred_orig - test_orig$amount)^2))
+  rmse_recovered <- sqrt(mean((pred_recovered - test_orig$amount)^2))
+
+  cat("RMSE (original): ", round(rmse_orig, 6), "\n")
+  cat("RMSE (deanonymized): ", round(rmse_recovered, 6), "\n")
+  cat("Difference: ", abs(rmse_orig - rmse_recovered), "\n")
+}
+```
+
+```{r model-skip, eval = !requireNamespace("ranger", quietly = TRUE)}
+# Install the ranger package to run the model performance comparison.
+```
+
+## Summary
+
+- Use `generate_key()` or `key_from_passphrase()` to get a secret key.
+- Use `anonymize_data(data, key)` to get anonymized data and a mapping; store both the key and the mapping if you need to reverse later.
+- Use `deanonymize_data(anon_data, key, mapping)` to recover the original data.
+- The anonymization is cryptographically key-dependent: without the key, the rotation cannot be re-derived and the dropped column cannot be decrypted.

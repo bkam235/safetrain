@@ -1,0 +1,18 @@
+Package: safetrain
+Title: Reversible, ML-Safe Anonymization
+Description: Key-based reversible anonymization of tabular data using a
+  cryptographic key-derived orthogonal rotation (HMAC-PRNG + QR decomposition).
+  All columns are encoded to numeric and transformed jointly; the rotation
+  matrix and centering/scaling are derived from the secret key and never stored,
+  so reversal requires the key. When two or more columns are anonymized, one
+  column is dropped and encrypted, producing a reduced output.
+Version: 0.1.0
+Authors@R: person("Author", role = c("aut", "cre"), email = "author@example.com")
+License: MIT + file LICENSE
+Encoding: UTF-8
+LazyData: true
+Imports: digest
+Suggests: testthat (>= 3.0.0), ranger, knitr, rmarkdown
+VignetteBuilder: knitr
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.3

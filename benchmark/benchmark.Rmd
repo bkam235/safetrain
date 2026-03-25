@@ -1,0 +1,240 @@
+---
+title: "Benchmarking ML Performance: Original vs Anonymized Data"
+output: html_notebook
+---
+
+This notebook compares the predictive performance of three ML models on three
+datasets, before and after anonymization with safetrain's cryptoencoder method.
+
+## Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(safetrain)
+library(mlbench)
+library(ranger)
+library(gbm)
+library(glmnet)
+
+set.seed(42)
+key <- generate_key()
+```
+
+## Helper Functions
+
+```{r helpers}
+#' Prepare a dataset: encode the target as factor (classification) or leave
+#' numeric (regression), return a list with data and target column name.
+prepare_dataset <- function(name) {
+
+  if (name == "BreastCancer") {
+    data(BreastCancer, package = "mlbench", envir = environment())
+    df <- BreastCancer
+    df$Id <- NULL
+    # coerce ordered factors to numeric
+    for (col in setdiff(names(df), "Class")) {
+      df[[col]] <- as.numeric(as.character(df[[col]]))
+    }
+    df <- na.omit(df)
+    list(data = df, target = "Class", task = "classification")
+
+  } else if (name == "PimaIndiansDiabetes") {
+    data(PimaIndiansDiabetes, package = "mlbench", envir = environment())
+    df <- PimaIndiansDiabetes
+    list(data = df, target = "diabetes", task = "classification")
+
+  } else if (name == "BostonHousing") {
+    data(BostonHousing, package = "mlbench", envir = environment())
+    df <- BostonHousing
+    # chas is a factor – convert to numeric for anonymization compatibility
+    df$chas <- as.numeric(as.character(df$chas))
+    list(data = df, target = "medv", task = "regression")
+  }
+}
+
+#' Anonymize feature columns with cryptoencoder.
+#' Expects a feature-only data frame (target already removed).
+anonymize_features <- function(features, key) {
+  res <- anonymize_data(features, key,
+                        opts = list(method = "cryptoencoder"))
+  res$data
+}
+
+#' Evaluate a model: accuracy for classification, RMSE for regression.
+evaluate <- function(preds, actual, task) {
+  if (task == "classification") {
+    mean(preds == actual)
+  } else {
+    sqrt(mean((preds - actual)^2))
+  }
+}
+
+#' Fit three models and return a named vector of performance scores.
+fit_models <- function(train, test, target, task) {
+  formula <- as.formula(paste(target, "~ ."))
+  scores <- c()
+
+  # --- ranger (random forest) ---
+  if (task == "classification") {
+    rf <- ranger(formula, data = train, num.trees = 500,
+                 classification = TRUE, seed = 1)
+    preds_rf <- predict(rf, data = test)$predictions
+  } else {
+    rf <- ranger(formula, data = train, num.trees = 500, seed = 1)
+    preds_rf <- predict(rf, data = test)$predictions
+  }
+  scores["ranger"] <- evaluate(preds_rf, test[[target]], task)
+
+  # --- gbm (gradient boosting) ---
+  if (task == "classification") {
+    lvls <- levels(train[[target]])
+    train_gbm <- train
+    train_gbm[[target]] <- as.integer(train_gbm[[target]]) - 1L
+    gb <- gbm(formula, data = train_gbm, distribution = "bernoulli",
+              n.trees = 500, interaction.depth = 3, shrinkage = 0.05,
+              n.minobsinnode = 10, verbose = FALSE)
+    prob <- predict(gb, newdata = test, n.trees = 500, type = "response")
+    preds_gb <- factor(lvls[(prob > 0.5) + 1], levels = lvls)
+  } else {
+    gb <- gbm(formula, data = train, distribution = "gaussian",
+              n.trees = 500, interaction.depth = 3, shrinkage = 0.05,
+              n.minobsinnode = 10, verbose = FALSE)
+    preds_gb <- predict(gb, newdata = test, n.trees = 500)
+  }
+  scores["gbm"] <- evaluate(preds_gb, test[[target]], task)
+
+  # --- glmnet (elastic net) ---
+  x_train <- model.matrix(formula, data = train)[, -1, drop = FALSE]
+  x_test  <- model.matrix(formula, data = test)[, -1, drop = FALSE]
+  if (task == "classification") {
+    y_train <- train[[target]]
+    gl <- cv.glmnet(x_train, y_train, family = "binomial", alpha = 0.5)
+    prob_gl <- predict(gl, newx = x_test, s = "lambda.min", type = "response")
+    lvls <- levels(y_train)
+    preds_gl <- factor(lvls[(prob_gl > 0.5) + 1], levels = lvls)
+  } else {
+    y_train <- train[[target]]
+    gl <- cv.glmnet(x_train, y_train, family = "gaussian", alpha = 0.5)
+    preds_gl <- as.numeric(predict(gl, newx = x_test, s = "lambda.min"))
+  }
+  scores["glmnet"] <- evaluate(preds_gl, test[[target]], task)
+
+  scores
+}
+```
+
+## Run Benchmark
+
+We use the same train/test split indices for original and anonymized data so the
+comparison is fair.
+
+```{r benchmark, message=FALSE, warning=FALSE}
+dataset_names <- c("BreastCancer", "PimaIndiansDiabetes", "BostonHousing")
+results <- list()
+
+for (ds_name in dataset_names) {
+  cat("===", ds_name, "===\n")
+  ds <- prepare_dataset(ds_name)
+  rownames(ds$data) <- NULL
+
+  # Separate target from features BEFORE anonymization (cf. dev.R)
+  y <- ds$data[[ds$target]]
+  X <- ds$data[, setdiff(names(ds$data), ds$target), drop = FALSE]
+
+  # Train/test split BEFORE anonymization to prevent leakage
+  n <- nrow(X)
+  if (ds$task == "classification") {
+    train_idx <- unlist(tapply(seq_len(n), y, function(i) {
+      sample(i, size = round(length(i) * 0.7))
+    }))
+  } else {
+    train_idx <- sample(seq_len(n), size = round(n * 0.7))
+  }
+  test_idx <- setdiff(seq_len(n), train_idx)
+
+  X_train <- X[train_idx, , drop = FALSE]
+  X_test  <- X[test_idx, , drop = FALSE]
+  y_train <- y[train_idx]
+  y_test  <- y[test_idx]
+
+  # Anonymize train and test separately so the autoencoder never sees test rows
+  anon_train <- anonymize_features(X_train, key)
+  anon_test  <- anonymize_features(X_test, key)
+
+  # Reassemble data frames with target for model fitting
+  orig_train <- X_train; orig_train[[ds$target]] <- y_train
+  orig_test  <- X_test;  orig_test[[ds$target]]  <- y_test
+  anon_train[[ds$target]] <- y_train
+  anon_test[[ds$target]]  <- y_test
+
+  scores_orig <- fit_models(orig_train, orig_test, ds$target, ds$task)
+  scores_anon <- fit_models(anon_train, anon_test, ds$target, ds$task)
+
+  results[[ds_name]] <- data.frame(
+    Dataset = ds_name,
+    Task    = ds$task,
+    Metric  = ifelse(ds$task == "classification", "Accuracy", "RMSE"),
+    Model   = names(scores_orig),
+    Original   = round(scores_orig, 4),
+    Anonymized = round(scores_anon, 4),
+    stringsAsFactors = FALSE
+  )
+
+  cat("  Original:  ", paste(names(scores_orig), round(scores_orig, 4),
+                              sep = "=", collapse = ", "), "\n")
+  cat("  Anonymized:", paste(names(scores_anon), round(scores_anon, 4),
+                              sep = "=", collapse = ", "), "\n\n")
+}
+
+all_results <- do.call(rbind, results)
+rownames(all_results) <- NULL
+```
+
+## Results Table
+
+```{r results_table}
+knitr::kable(all_results, caption = "ML Performance: Original vs Anonymized")
+```
+
+## Visualization
+
+```{r plot, fig.width=10, fig.height=5}
+par(mfrow = c(1, 3), mar = c(5, 4, 3, 1))
+
+for (ds_name in dataset_names) {
+  df <- all_results[all_results$Dataset == ds_name, ]
+  n_models <- nrow(df)
+  metric <- df$Metric[1]
+
+  bar_vals <- rbind(df$Original, df$Anonymized)
+  colnames(bar_vals) <- df$Model
+
+  y_range <- range(bar_vals)
+  y_pad   <- diff(y_range) * 0.15
+  ylim    <- c(max(0, y_range[1] - y_pad), y_range[2] + y_pad)
+
+  barplot(bar_vals, beside = TRUE, col = c("steelblue", "coral"),
+          main = ds_name, ylab = metric, ylim = ylim,
+          names.arg = df$Model, legend.text = c("Original", "Anonymized"),
+          args.legend = list(x = "topright", cex = 0.8))
+}
+```
+
+## Summary
+
+```{r summary}
+cat("Datasets:", length(dataset_names), "\n")
+cat("Models:   ranger, gbm, glmnet\n")
+cat("Method:   cryptoencoder anonymization\n\n")
+
+for (ds_name in dataset_names) {
+  df <- all_results[all_results$Dataset == ds_name, ]
+  metric <- df$Metric[1]
+  if (metric == "Accuracy") {
+    avg_drop <- mean(df$Original - df$Anonymized)
+    cat(sprintf("%s: average accuracy change = %+.4f\n", ds_name, -avg_drop))
+  } else {
+    avg_change <- mean(df$Anonymized - df$Original)
+    cat(sprintf("%s: average RMSE change = %+.4f\n", ds_name, avg_change))
+  }
+}
+```

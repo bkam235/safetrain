@@ -1,0 +1,16 @@
+#' Sample dataset for safetrain
+#'
+#' Synthetic customer-style data with mixed types: identifier, categorical
+#' (factor/character), and numeric columns. Used in tests and vignettes.
+#'
+#' @format A data frame with 1000 rows and 7 variables:
+#' \describe{
+#'   \item{user_id}{Character identifier (e.g. U00001).}
+#'   \item{region}{Factor: North, South, East, West.}
+#'   \item{product}{Character: product codes A--E.}
+#'   \item{amount}{Numeric: purchase amount.}
+#'   \item{count}{Integer: count.}
+#'   \item{date}{Date: transaction date.}
+#' }
+#' @source Generated synthetically for package examples and tests.
+"sample_data"

@@ -137,12 +137,12 @@ box_muller <- function(uniforms) {
 #' @param n Integer dimension.
 #' @return n x n orthogonal matrix Q.
 #' @noRd
-generate_key_rotation <- function(key, n) {
+generate_key_rotation <- function(key, n, label = "rotation-matrix") {
   n_normals <- n * n
   # Need 2 uniforms per normal (Box-Muller), 4 bytes per uniform
   n_uniforms <- 2L * n_normals
   n_bytes <- 4L * n_uniforms
-  raw_bytes <- hmac_prng_stream(key, "rotation-matrix", n_bytes)
+  raw_bytes <- hmac_prng_stream(key, label, n_bytes)
   uniforms <- bytes_to_uniforms(raw_bytes, n_uniforms)
   normals <- box_muller(uniforms)
   G <- matrix(normals[seq_len(n_normals)], nrow = n, ncol = n)
@@ -656,12 +656,19 @@ transform_numeric_cryptoencoder <- function(mat, key, opts = list()) {
   fwd <- ae_forward(x_norm, ae$weights$W_enc, ae$weights$b_enc,
                     ae$weights$W_dec, ae$weights$b_dec)
 
+  # Key-derived post-rotation: guarantees every output column depends on ALL
+
+  # hidden units, closing the theoretical gap where training could zero out
+  # individual encoder weights and create column-to-column correspondence.
+  Q_post <- generate_key_rotation(key, n_cols, label = "post-encoder-rotation")
+  hidden_rotated <- fwd$hidden %*% Q_post
+
   # Encrypt trained weights + normalization params
   encrypted_weights <- encrypt_ae_weights(ae$weights, ae$data_center,
                                           ae$data_scale, key)
 
   list(
-    values = fwd$hidden,
+    values = hidden_rotated,
     pca_info = list(
       n_original_cols = n_cols,
       col_names = col_names,
@@ -683,13 +690,18 @@ transform_numeric_cryptoencoder <- function(mat, key, opts = list()) {
 #' @noRd
 untransform_numeric_cryptoencoder <- function(scores, pca_info, key) {
   col_names <- pca_info$col_names
+  n_cols <- pca_info$n_original_cols
+
+  # Reverse key-derived post-rotation
+  Q_post <- generate_key_rotation(key, n_cols, label = "post-encoder-rotation")
+  hidden <- scores %*% t(Q_post)
 
   # Decrypt stored weights
   dec <- decrypt_ae_weights(pca_info$encrypted_weights, key)
 
-  # Decoder pass: scores are hidden (tanh) activations
-  N <- nrow(scores)
-  output <- scores %*% dec$weights$W_dec +
+  # Decoder pass: hidden are the tanh activations
+  N <- nrow(hidden)
+  output <- hidden %*% dec$weights$W_dec +
     matrix(dec$weights$b_dec, nrow = N, ncol = length(dec$weights$b_dec),
            byrow = TRUE)
 

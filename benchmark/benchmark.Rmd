@@ -3,8 +3,10 @@ title: "Benchmarking ML Performance: Original vs Anonymized Data"
 output: html_notebook
 ---
 
-This notebook compares the predictive performance of three ML models on three
+This notebook compares the predictive performance of ML models on a variety of
 datasets, before and after anonymization with safetrain's cryptoencoder method.
+It covers classification and regression tasks across different dataset sizes,
+column counts, and data characteristics.
 
 ## Setup
 
@@ -14,23 +16,25 @@ library(mlbench)
 library(ranger)
 library(gbm)
 library(glmnet)
+library(MASS)
 
 set.seed(42)
 key <- generate_key()
+
+N_CV_FOLDS <- 5
+N_REPEATS  <- 3
 ```
 
 ## Helper Functions
 
 ```{r helpers}
-#' Prepare a dataset: encode the target as factor (classification) or leave
-#' numeric (regression), return a list with data and target column name.
+#' Prepare a dataset: returns list with data, target column name, and task type.
 prepare_dataset <- function(name) {
 
   if (name == "BreastCancer") {
     data(BreastCancer, package = "mlbench", envir = environment())
     df <- BreastCancer
     df$Id <- NULL
-    # coerce ordered factors to numeric
     for (col in setdiff(names(df), "Class")) {
       df[[col]] <- as.numeric(as.character(df[[col]]))
     }
@@ -45,44 +49,295 @@ prepare_dataset <- function(name) {
   } else if (name == "BostonHousing") {
     data(BostonHousing, package = "mlbench", envir = environment())
     df <- BostonHousing
-    # chas is a factor – convert to numeric for anonymization compatibility
     df$chas <- as.numeric(as.character(df$chas))
     list(data = df, target = "medv", task = "regression")
+
+  } else if (name == "Ionosphere") {
+    data(Ionosphere, package = "mlbench", envir = environment())
+    df <- Ionosphere
+    # V2 is constant zero in this dataset
+    df$V2 <- NULL
+    for (col in setdiff(names(df), "Class")) {
+      df[[col]] <- as.numeric(df[[col]])
+    }
+    list(data = df, target = "Class", task = "classification")
+
+  } else if (name == "Sonar") {
+    data(Sonar, package = "mlbench", envir = environment())
+    df <- Sonar
+    list(data = df, target = "Class", task = "classification")
+
+  } else if (name == "Glass") {
+    data(Glass, package = "mlbench", envir = environment())
+    df <- Glass
+    # Binary: window vs non-window glass
+    df$Type <- factor(ifelse(df$Type %in% c(1, 2, 3), "window", "non-window"))
+    list(data = df, target = "Type", task = "classification")
+
+  } else if (name == "Vehicle") {
+    data(Vehicle, package = "mlbench", envir = environment())
+    df <- Vehicle
+    # Binary: bus vs non-bus
+    df$Class <- factor(ifelse(df$Class == "bus", "bus", "other"))
+    list(data = df, target = "Class", task = "classification")
+
+  } else if (name == "Servo") {
+    data(Servo, package = "mlbench", envir = environment())
+    df <- Servo
+    for (col in names(df)) {
+      if (is.factor(df[[col]]) && col != "class") {
+        df[[col]] <- as.numeric(df[[col]])
+      }
+    }
+    names(df)[names(df) == "class"] <- "y"
+    list(data = df, target = "y", task = "regression")
+
+  } else if (name == "Ozone") {
+    data(Ozone, package = "mlbench", envir = environment())
+    df <- Ozone
+    # Convert all factors to numeric
+    for (col in names(df)) {
+      if (is.factor(df[[col]])) df[[col]] <- as.numeric(df[[col]])
+    }
+    df <- na.omit(df)
+    names(df)[1] <- "ozone"
+    list(data = df, target = "ozone", task = "regression")
+
+  } else if (name == "Synthetic_Wide") {
+    # Synthetic dataset: 2000 rows, 50 numeric features
+    n <- 2000; p <- 50
+    X <- matrix(rnorm(n * p), nrow = n)
+    colnames(X) <- paste0("V", seq_len(p))
+    beta <- rnorm(p) * c(rep(1, 10), rep(0.1, p - 10))
+    y <- X %*% beta + rnorm(n, sd = 2)
+    df <- as.data.frame(X)
+    df$y <- as.numeric(y)
+    list(data = df, target = "y", task = "regression")
+
+  } else if (name == "Synthetic_Large") {
+    # Synthetic dataset: 10000 rows, 20 features, binary classification
+    n <- 10000; p <- 20
+    X <- matrix(rnorm(n * p), nrow = n)
+    colnames(X) <- paste0("V", seq_len(p))
+    logit <- X[, 1] * 0.8 + X[, 2] * 0.6 - X[, 3] * 0.5 +
+             X[, 1] * X[, 2] * 0.3 + rnorm(n, sd = 0.5)
+    prob <- 1 / (1 + exp(-logit))
+    y <- factor(ifelse(rbinom(n, 1, prob) == 1, "pos", "neg"))
+    df <- as.data.frame(X)
+    df$y <- y
+    list(data = df, target = "y", task = "classification")
+
+  } else if (name == "Synthetic_VeryWide") {
+    # Synthetic dataset: 1000 rows, 100 features
+    n <- 1000; p <- 100
+    X <- matrix(rnorm(n * p), nrow = n)
+    colnames(X) <- paste0("V", seq_len(p))
+    beta <- rep(0, p)
+    beta[1:15] <- rnorm(15)
+    y <- X %*% beta + rnorm(n, sd = 3)
+    df <- as.data.frame(X)
+    df$y <- as.numeric(y)
+    list(data = df, target = "y", task = "regression")
+
+  } else if (name == "Synthetic_Huge") {
+    # Large classification: 50000 rows, 30 features
+    n <- 50000; p <- 30
+    X <- matrix(rnorm(n * p), nrow = n)
+    colnames(X) <- paste0("V", seq_len(p))
+    logit <- X[, 1] * 1.0 + X[, 2] * 0.7 - X[, 3] * 0.5 +
+             X[, 4] * X[, 5] * 0.4 + sin(X[, 6]) * 0.6 + rnorm(n, sd = 0.5)
+    prob <- 1 / (1 + exp(-logit))
+    y <- factor(ifelse(rbinom(n, 1, prob) == 1, "pos", "neg"))
+    df <- as.data.frame(X)
+    df$y <- y
+    list(data = df, target = "y", task = "classification")
+
+  } else if (name == "Synthetic_VeryLarge_Reg") {
+    # Large regression: 20000 rows, 40 features
+    n <- 20000; p <- 40
+    X <- matrix(rnorm(n * p), nrow = n)
+    colnames(X) <- paste0("V", seq_len(p))
+    beta <- c(rnorm(10, sd = 2), rnorm(10, sd = 0.5), rep(0, p - 20))
+    y <- X %*% beta + X[, 1] * X[, 2] * 0.5 + rnorm(n, sd = 2)
+    df <- as.data.frame(X)
+    df$y <- as.numeric(y)
+    list(data = df, target = "y", task = "regression")
+
+  } else if (name == "Synthetic_UltraWide") {
+    # p >> n scenario: 500 rows, 200 features
+    n <- 500; p <- 200
+    X <- matrix(rnorm(n * p), nrow = n)
+    colnames(X) <- paste0("V", seq_len(p))
+    beta <- rep(0, p)
+    beta[1:8] <- rnorm(8, sd = 2)
+    y <- X %*% beta + rnorm(n, sd = 2)
+    df <- as.data.frame(X)
+    df$y <- as.numeric(y)
+    list(data = df, target = "y", task = "regression")
+
+  } else if (name == "Synthetic_HighDim_Clf") {
+    # High-dimensional classification: 5000 rows, 100 features
+    n <- 5000; p <- 100
+    X <- matrix(rnorm(n * p), nrow = n)
+    colnames(X) <- paste0("V", seq_len(p))
+    logit <- X[, 1:5] %*% c(1.2, 0.8, -0.6, 0.4, -0.3) +
+             X[, 1] * X[, 3] * 0.5 + rnorm(n, sd = 0.7)
+    prob <- 1 / (1 + exp(-logit))
+    y <- factor(ifelse(rbinom(n, 1, prob) == 1, "pos", "neg"))
+    df <- as.data.frame(X)
+    df$y <- y
+    list(data = df, target = "y", task = "classification")
+
+  } else if (name == "Synthetic_Correlated") {
+    # Correlated features: 3000 rows, 30 features with block correlation
+    n <- 3000; p <- 30
+    sigma <- diag(p)
+    # Create 3 blocks of 10 correlated features
+    for (block in 0:2) {
+      idx <- (block * 10 + 1):(block * 10 + 10)
+      sigma[idx, idx] <- 0.6
+      diag(sigma[idx, idx]) <- 1
+    }
+    X <- MASS::mvrnorm(n, mu = rep(0, p), Sigma = sigma)
+    colnames(X) <- paste0("V", seq_len(p))
+    beta <- c(rnorm(10, sd = 1.5), rnorm(10, sd = 0.5), rep(0, 10))
+    y <- X %*% beta + rnorm(n, sd = 2)
+    df <- as.data.frame(X)
+    df$y <- as.numeric(y)
+    list(data = df, target = "y", task = "regression")
+
+  } else if (name == "Synthetic_Sparse_Signal") {
+    # Sparse signal: 4000 rows, 80 features, only 5 informative
+    n <- 4000; p <- 80
+    X <- matrix(rnorm(n * p), nrow = n)
+    colnames(X) <- paste0("V", seq_len(p))
+    logit <- X[, 1] * 1.5 + X[, 2] * 1.0 + X[, 3] * 0.8 +
+             X[, 4] * 0.6 + X[, 5] * 0.4 + rnorm(n, sd = 0.5)
+    prob <- 1 / (1 + exp(-logit))
+    y <- factor(ifelse(rbinom(n, 1, prob) == 1, "pos", "neg"))
+    df <- as.data.frame(X)
+    df$y <- y
+    list(data = df, target = "y", task = "classification")
+
+  } else if (name == "Synthetic_Nonlinear") {
+    # Nonlinear regression: 3000 rows, 20 features
+    n <- 3000; p <- 20
+    X <- matrix(rnorm(n * p), nrow = n)
+    colnames(X) <- paste0("V", seq_len(p))
+    y <- sin(X[, 1] * 2) + X[, 2]^2 + exp(X[, 3] * 0.5) +
+         X[, 4] * X[, 5] + log(abs(X[, 6]) + 1) + rnorm(n, sd = 0.5)
+    df <- as.data.frame(X)
+    df$y <- as.numeric(y)
+    list(data = df, target = "y", task = "regression")
+
+  } else if (name == "Synthetic_Imbalanced") {
+    # Imbalanced classification: 5000 rows, 25 features, 10% positive
+    n <- 5000; p <- 25
+    X <- matrix(rnorm(n * p), nrow = n)
+    colnames(X) <- paste0("V", seq_len(p))
+    logit <- X[, 1] * 1.0 + X[, 2] * 0.8 - X[, 3] * 0.6 - 2.0  # shift for imbalance
+    prob <- 1 / (1 + exp(-logit))
+    y <- factor(ifelse(rbinom(n, 1, prob) == 1, "pos", "neg"))
+    df <- as.data.frame(X)
+    df$y <- y
+    list(data = df, target = "y", task = "classification")
   }
 }
 
 #' Anonymize feature columns with cryptoencoder.
-#' Expects a feature-only data frame (target already removed).
 anonymize_features <- function(features, key) {
   res <- anonymize_data(features, key,
                         opts = list(method = "cryptoencoder"))
   res$data
 }
 
-#' Evaluate a model: accuracy for classification, RMSE for regression.
-evaluate <- function(preds, actual, task) {
-  if (task == "classification") {
-    mean(preds == actual)
+#' Compute classification metrics.
+classification_metrics <- function(preds, actual, model_obj = NULL,
+                                   test_data = NULL, target = NULL,
+                                   task_formula = NULL) {
+  acc <- mean(preds == actual)
+  lvls <- levels(actual)
+
+  # Confusion matrix for binary tasks
+  if (length(lvls) == 2) {
+    tp <- sum(preds == lvls[2] & actual == lvls[2])
+    fp <- sum(preds == lvls[2] & actual == lvls[1])
+    fn <- sum(preds == lvls[1] & actual == lvls[2])
+    tn <- sum(preds == lvls[1] & actual == lvls[1])
+
+    precision <- if ((tp + fp) > 0) tp / (tp + fp) else 0
+    recall    <- if ((tp + fn) > 0) tp / (tp + fn) else 0
+    f1        <- if ((precision + recall) > 0) {
+      2 * precision * recall / (precision + recall)
+    } else {
+      0
+    }
+
+    # Balanced accuracy
+    spec <- if ((tn + fp) > 0) tn / (tn + fp) else 0
+    sens <- recall
+    bal_acc <- (sens + spec) / 2
+
+    # Matthews Correlation Coefficient
+    mcc_num <- (tp * tn) - (fp * fn)
+    mcc_den <- sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+    mcc <- if (mcc_den > 0) mcc_num / mcc_den else 0
+
+    # Cohen's Kappa
+    n_total <- tp + fp + fn + tn
+    p_obs <- (tp + tn) / n_total
+    p_yes <- ((tp + fp) / n_total) * ((tp + fn) / n_total)
+    p_no  <- ((fn + tn) / n_total) * ((fp + tn) / n_total)
+    p_exp <- p_yes + p_no
+    kappa <- if (p_exp < 1) (p_obs - p_exp) / (1 - p_exp) else 0
+
+    c(Accuracy = acc, Balanced_Acc = bal_acc,
+      Precision = precision, Recall = recall, F1 = f1,
+      MCC = mcc, Kappa = kappa)
   } else {
-    sqrt(mean((preds - actual)^2))
+    c(Accuracy = acc, Balanced_Acc = NA,
+      Precision = NA, Recall = NA, F1 = NA,
+      MCC = NA, Kappa = NA)
   }
 }
 
-#' Fit three models and return a named vector of performance scores.
+#' Compute regression metrics.
+regression_metrics <- function(preds, actual) {
+  residuals <- actual - preds
+  n <- length(actual)
+  rmse <- sqrt(mean(residuals^2))
+  mae  <- mean(abs(residuals))
+  medae <- median(abs(residuals))
+  max_err <- max(abs(residuals))
+  ss_res <- sum(residuals^2)
+  ss_tot <- sum((actual - mean(actual))^2)
+  r2 <- 1 - ss_res / ss_tot
+  # MAPE, guarding against zero actuals
+  nonzero <- actual != 0
+  mape <- if (any(nonzero)) mean(abs(residuals[nonzero] / actual[nonzero])) * 100 else NA
+  # Explained variance score
+  ev <- 1 - var(residuals) / var(actual)
+
+  c(RMSE = rmse, MAE = mae, MedAE = medae, Max_Error = max_err,
+    R2 = r2, MAPE = mape, Expl_Var = ev)
+}
+
+#' Fit three models and return a data frame of performance metrics.
 fit_models <- function(train, test, target, task) {
   formula <- as.formula(paste(target, "~ ."))
-  scores <- c()
+  all_metrics <- list()
 
   # --- ranger (random forest) ---
   if (task == "classification") {
     rf <- ranger(formula, data = train, num.trees = 500,
                  classification = TRUE, seed = 1)
     preds_rf <- predict(rf, data = test)$predictions
+    all_metrics[["ranger"]] <- classification_metrics(preds_rf, test[[target]])
   } else {
     rf <- ranger(formula, data = train, num.trees = 500, seed = 1)
     preds_rf <- predict(rf, data = test)$predictions
+    all_metrics[["ranger"]] <- regression_metrics(preds_rf, test[[target]])
   }
-  scores["ranger"] <- evaluate(preds_rf, test[[target]], task)
 
   # --- gbm (gradient boosting) ---
   if (task == "classification") {
@@ -94,13 +349,14 @@ fit_models <- function(train, test, target, task) {
               n.minobsinnode = 10, verbose = FALSE)
     prob <- predict(gb, newdata = test, n.trees = 500, type = "response")
     preds_gb <- factor(lvls[(prob > 0.5) + 1], levels = lvls)
+    all_metrics[["gbm"]] <- classification_metrics(preds_gb, test[[target]])
   } else {
     gb <- gbm(formula, data = train, distribution = "gaussian",
               n.trees = 500, interaction.depth = 3, shrinkage = 0.05,
               n.minobsinnode = 10, verbose = FALSE)
     preds_gb <- predict(gb, newdata = test, n.trees = 500)
+    all_metrics[["gbm"]] <- regression_metrics(preds_gb, test[[target]])
   }
-  scores["gbm"] <- evaluate(preds_gb, test[[target]], task)
 
   # --- glmnet (elastic net) ---
   x_train <- model.matrix(formula, data = train)[, -1, drop = FALSE]
@@ -111,36 +367,71 @@ fit_models <- function(train, test, target, task) {
     prob_gl <- predict(gl, newx = x_test, s = "lambda.min", type = "response")
     lvls <- levels(y_train)
     preds_gl <- factor(lvls[(prob_gl > 0.5) + 1], levels = lvls)
+    all_metrics[["glmnet"]] <- classification_metrics(preds_gl, test[[target]])
   } else {
     y_train <- train[[target]]
     gl <- cv.glmnet(x_train, y_train, family = "gaussian", alpha = 0.5)
     preds_gl <- as.numeric(predict(gl, newx = x_test, s = "lambda.min"))
+    all_metrics[["glmnet"]] <- regression_metrics(preds_gl, test[[target]])
   }
-  scores["glmnet"] <- evaluate(preds_gl, test[[target]], task)
 
-  scores
+  # --- LDA (classification only) / Ridge regression ---
+  if (task == "classification") {
+    lda_fit <- tryCatch({
+      MASS::lda(formula, data = train)
+    }, error = function(e) NULL)
+    if (!is.null(lda_fit)) {
+      preds_lda <- predict(lda_fit, newdata = test)$class
+      all_metrics[["lda"]] <- classification_metrics(preds_lda, test[[target]])
+    }
+  } else {
+    gl_ridge <- cv.glmnet(x_train, y_train, family = "gaussian", alpha = 0)
+    preds_ridge <- as.numeric(predict(gl_ridge, newx = x_test, s = "lambda.min"))
+    all_metrics[["ridge"]] <- regression_metrics(preds_ridge, test[[target]])
+  }
+
+  all_metrics
 }
 ```
 
 ## Run Benchmark
 
-We use the same train/test split indices for original and anonymized data so the
-comparison is fair.
+We use stratified (classification) or random (regression) train/test splits.
+Anonymization is applied separately to train and test to prevent leakage.
 
 ```{r benchmark, message=FALSE, warning=FALSE}
-dataset_names <- c("BreastCancer", "PimaIndiansDiabetes", "BostonHousing")
+dataset_names <- c(
+  # Real-world classification
+  "BreastCancer", "PimaIndiansDiabetes", "Ionosphere", "Sonar",
+  "Glass", "Vehicle",
+  # Real-world regression
+  "BostonHousing", "Ozone"
+  # # Synthetic datasets (various sizes and characteristics)
+  # "Synthetic_Wide", 
+  # #"Synthetic_Large", 
+  # "Synthetic_VeryWide"
+  # #"Synthetic_Huge", 
+  # # "Synthetic_VeryLarge_Reg", "Synthetic_UltraWide",
+  # # #"Synthetic_HighDim_Clf", 
+  # # "Synthetic_Correlated", "Synthetic_Sparse_Signal",
+  # # "Synthetic_Nonlinear", "Synthetic_Imbalanced"
+)
+
 results <- list()
+timing  <- list()
 
 for (ds_name in dataset_names) {
   cat("===", ds_name, "===\n")
   ds <- prepare_dataset(ds_name)
   rownames(ds$data) <- NULL
 
-  # Separate target from features BEFORE anonymization (cf. dev.R)
+  cat("  Rows:", nrow(ds$data), " Cols:", ncol(ds$data) - 1,
+      " Task:", ds$task, "\n")
+
   y <- ds$data[[ds$target]]
   X <- ds$data[, setdiff(names(ds$data), ds$target), drop = FALSE]
 
-  # Train/test split BEFORE anonymization to prevent leakage
+  # Train/test split
   n <- nrow(X)
   if (ds$task == "classification") {
     train_idx <- unlist(tapply(seq_len(n), y, function(i) {
@@ -156,85 +447,310 @@ for (ds_name in dataset_names) {
   y_train <- y[train_idx]
   y_test  <- y[test_idx]
 
-  # Anonymize train and test separately so the autoencoder never sees test rows
+  # Time the anonymization step
+  t0 <- proc.time()
   anon_train <- anonymize_features(X_train, key)
   anon_test  <- anonymize_features(X_test, key)
+  t_anon <- (proc.time() - t0)[["elapsed"]]
 
-  # Reassemble data frames with target for model fitting
+  timing[[ds_name]] <- data.frame(
+    Dataset = ds_name,
+    Rows = nrow(ds$data),
+    Features = ncol(X),
+    Anon_Time_Sec = round(t_anon, 3),
+    stringsAsFactors = FALSE
+  )
+
+  # Reassemble with target
+
   orig_train <- X_train; orig_train[[ds$target]] <- y_train
   orig_test  <- X_test;  orig_test[[ds$target]]  <- y_test
   anon_train[[ds$target]] <- y_train
   anon_test[[ds$target]]  <- y_test
 
-  scores_orig <- fit_models(orig_train, orig_test, ds$target, ds$task)
-  scores_anon <- fit_models(anon_train, anon_test, ds$target, ds$task)
+  metrics_orig <- fit_models(orig_train, orig_test, ds$target, ds$task)
+  metrics_anon <- fit_models(anon_train, anon_test, ds$target, ds$task)
 
-  results[[ds_name]] <- data.frame(
-    Dataset = ds_name,
-    Task    = ds$task,
-    Metric  = ifelse(ds$task == "classification", "Accuracy", "RMSE"),
-    Model   = names(scores_orig),
-    Original   = round(scores_orig, 4),
-    Anonymized = round(scores_anon, 4),
-    stringsAsFactors = FALSE
-  )
+  for (model_name in names(metrics_orig)) {
+    mo <- metrics_orig[[model_name]]
+    ma <- metrics_anon[[model_name]]
+    metric_names <- names(mo)
 
-  cat("  Original:  ", paste(names(scores_orig), round(scores_orig, 4),
-                              sep = "=", collapse = ", "), "\n")
-  cat("  Anonymized:", paste(names(scores_anon), round(scores_anon, 4),
-                              sep = "=", collapse = ", "), "\n\n")
+    for (mn in metric_names) {
+      results[[paste(ds_name, model_name, mn, sep = "|")]] <- data.frame(
+        Dataset    = ds_name,
+        Task       = ds$task,
+        Features   = ncol(X),
+        Rows       = nrow(ds$data),
+        Model      = model_name,
+        Metric     = mn,
+        Original   = round(mo[[mn]], 4),
+        Anonymized = round(ma[[mn]], 4),
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+
+  cat("  Anonymization time:", round(t_anon, 3), "sec\n\n")
 }
 
 all_results <- do.call(rbind, results)
 rownames(all_results) <- NULL
+all_timing <- do.call(rbind, timing)
+rownames(all_timing) <- NULL
 ```
 
-## Results Table
+## Results: Classification Datasets
 
-```{r results_table}
-knitr::kable(all_results, caption = "ML Performance: Original vs Anonymized")
+```{r results_classification}
+clf_results <- all_results[all_results$Task == "classification", ]
+knitr::kable(
+  clf_results[, c("Dataset", "Rows", "Features", "Model", "Metric",
+                   "Original", "Anonymized")],
+  caption = "Classification: Original vs Anonymized"
+)
 ```
 
-## Visualization
+## Results: Regression Datasets
 
-```{r plot, fig.width=10, fig.height=5}
-par(mfrow = c(1, 3), mar = c(5, 4, 3, 1))
+```{r results_regression}
+reg_results <- all_results[all_results$Task == "regression", ]
+knitr::kable(
+  reg_results[, c("Dataset", "Rows", "Features", "Model", "Metric",
+                   "Original", "Anonymized")],
+  caption = "Regression: Original vs Anonymized"
+)
+```
 
-for (ds_name in dataset_names) {
-  df <- all_results[all_results$Dataset == ds_name, ]
-  n_models <- nrow(df)
-  metric <- df$Metric[1]
+## Anonymization Timing
 
-  bar_vals <- rbind(df$Original, df$Anonymized)
-  colnames(bar_vals) <- df$Model
+```{r timing_table}
+knitr::kable(all_timing, caption = "Anonymization Time by Dataset Size")
+```
 
-  y_range <- range(bar_vals)
+## Metric Degradation Summary
+
+How much does anonymization degrade each metric on average?
+
+```{r degradation}
+# For each metric, compute average absolute change across datasets and models
+clf_acc <- clf_results[clf_results$Metric == "Accuracy", ]
+clf_f1  <- clf_results[clf_results$Metric == "F1" & !is.na(clf_results$Original), ]
+reg_rmse <- reg_results[reg_results$Metric == "RMSE", ]
+reg_r2   <- reg_results[reg_results$Metric == "R2", ]
+
+summary_df <- data.frame(
+  Metric = c("Accuracy", "F1", "RMSE", "R-squared"),
+  Avg_Original = c(
+    mean(clf_acc$Original, na.rm = TRUE),
+    mean(clf_f1$Original, na.rm = TRUE),
+    mean(reg_rmse$Original, na.rm = TRUE),
+    mean(reg_r2$Original, na.rm = TRUE)
+  ),
+  Avg_Anonymized = c(
+    mean(clf_acc$Anonymized, na.rm = TRUE),
+    mean(clf_f1$Anonymized, na.rm = TRUE),
+    mean(reg_rmse$Anonymized, na.rm = TRUE),
+    mean(reg_r2$Anonymized, na.rm = TRUE)
+  ),
+  stringsAsFactors = FALSE
+)
+summary_df$Avg_Original   <- round(summary_df$Avg_Original, 4)
+summary_df$Avg_Anonymized <- round(summary_df$Avg_Anonymized, 4)
+summary_df$Change <- round(summary_df$Avg_Anonymized - summary_df$Avg_Original, 4)
+
+knitr::kable(summary_df, caption = "Average Metric Degradation from Anonymization")
+```
+
+## Visualization: Accuracy and F1 by Dataset
+
+```{r plot_classification, fig.width=12, fig.height=8}
+par(mfrow = c(2, 3), mar = c(6, 4, 3, 1))
+
+clf_datasets <- unique(clf_results$Dataset)
+
+for (ds_name in clf_datasets) {
+  df_acc <- clf_results[clf_results$Dataset == ds_name &
+                        clf_results$Metric == "Accuracy", ]
+  bar_vals <- rbind(df_acc$Original, df_acc$Anonymized)
+  colnames(bar_vals) <- df_acc$Model
+
+  y_range <- range(bar_vals, na.rm = TRUE)
   y_pad   <- diff(y_range) * 0.15
-  ylim    <- c(max(0, y_range[1] - y_pad), y_range[2] + y_pad)
+  ylim    <- c(max(0, y_range[1] - y_pad), min(1, y_range[2] + y_pad))
 
   barplot(bar_vals, beside = TRUE, col = c("steelblue", "coral"),
-          main = ds_name, ylab = metric, ylim = ylim,
-          names.arg = df$Model, legend.text = c("Original", "Anonymized"),
-          args.legend = list(x = "topright", cex = 0.8))
+          main = paste(ds_name, "- Accuracy"), ylab = "Accuracy", ylim = ylim,
+          names.arg = df_acc$Model, las = 2,
+          legend.text = c("Original", "Anonymized"),
+          args.legend = list(x = "topright", cex = 0.7))
 }
 ```
 
-## Summary
+```{r plot_f1, fig.width=12, fig.height=8}
+par(mfrow = c(2, 3), mar = c(6, 4, 3, 1))
+
+for (ds_name in clf_datasets) {
+  df_f1 <- clf_results[clf_results$Dataset == ds_name &
+                       clf_results$Metric == "F1" &
+                       !is.na(clf_results$Original), ]
+  if (nrow(df_f1) == 0) next
+
+  bar_vals <- rbind(df_f1$Original, df_f1$Anonymized)
+  colnames(bar_vals) <- df_f1$Model
+
+  y_range <- range(bar_vals, na.rm = TRUE)
+  y_pad   <- diff(y_range) * 0.15
+  ylim    <- c(max(0, y_range[1] - y_pad), min(1, y_range[2] + y_pad))
+
+  barplot(bar_vals, beside = TRUE, col = c("steelblue", "coral"),
+          main = paste(ds_name, "- F1 Score"), ylab = "F1", ylim = ylim,
+          names.arg = df_f1$Model, las = 2,
+          legend.text = c("Original", "Anonymized"),
+          args.legend = list(x = "topright", cex = 0.7))
+}
+```
+
+## Visualization: Regression Metrics
+
+```{r plot_regression, fig.width=12, fig.height=10}
+reg_datasets <- unique(reg_results$Dataset)
+n_reg <- length(reg_datasets)
+
+par(mfrow = c(n_reg, 2), mar = c(6, 4, 3, 1))
+
+for (ds_name in reg_datasets) {
+  # RMSE
+  df_rmse <- reg_results[reg_results$Dataset == ds_name &
+                         reg_results$Metric == "RMSE", ]
+  bar_vals <- rbind(df_rmse$Original, df_rmse$Anonymized)
+  colnames(bar_vals) <- df_rmse$Model
+
+  y_range <- range(bar_vals, na.rm = TRUE)
+  y_pad   <- diff(y_range) * 0.2
+  ylim    <- c(0, y_range[2] + y_pad)
+
+  barplot(bar_vals, beside = TRUE, col = c("steelblue", "coral"),
+          main = paste(ds_name, "- RMSE"), ylab = "RMSE", ylim = ylim,
+          names.arg = df_rmse$Model, las = 2,
+          legend.text = c("Original", "Anonymized"),
+          args.legend = list(x = "topright", cex = 0.7))
+
+  # R-squared
+  df_r2 <- reg_results[reg_results$Dataset == ds_name &
+                       reg_results$Metric == "R2", ]
+  bar_vals <- rbind(df_r2$Original, df_r2$Anonymized)
+  colnames(bar_vals) <- df_r2$Model
+
+  y_range <- range(bar_vals, na.rm = TRUE)
+  y_pad   <- diff(y_range) * 0.2
+  ylim    <- c(min(0, y_range[1] - y_pad), max(1, y_range[2] + y_pad))
+
+  barplot(bar_vals, beside = TRUE, col = c("steelblue", "coral"),
+          main = paste(ds_name, "- R-squared"), ylab = "R²", ylim = ylim,
+          names.arg = df_r2$Model, las = 2,
+          legend.text = c("Original", "Anonymized"),
+          args.legend = list(x = "topright", cex = 0.7))
+}
+```
+
+## Scaling Benchmark
+
+How does anonymization time scale with dataset size and dimensionality?
+
+```{r scaling, message=FALSE, warning=FALSE}
+# scale_rows <- c(500, 1000, 2000, 5000, 10000, 20000, 50000)
+# scale_cols <- c(10, 25, 50, 100, 200)
+# 
+# scale_results <- list()
+# idx <- 1
+# 
+# for (p in scale_cols) {
+#   for (n in scale_rows) {
+#     X <- as.data.frame(matrix(rnorm(n * p), nrow = n))
+#     names(X) <- paste0("V", seq_len(p))
+# 
+#     t0 <- proc.time()
+#     anonymize_features(X, key)
+#     elapsed <- (proc.time() - t0)[["elapsed"]]
+# 
+#     scale_results[[idx]] <- data.frame(
+#       Rows = n, Features = p, Time_Sec = round(elapsed, 3),
+#       stringsAsFactors = FALSE
+#     )
+#     idx <- idx + 1
+#   }
+# }
+# 
+# scale_df <- do.call(rbind, scale_results)
+# knitr::kable(scale_df, caption = "Anonymization Time: Rows x Features")
+```
+
+```{r scaling_plot, fig.width=10, fig.height=5}
+# par(mfrow = c(1, 2), mar = c(5, 4, 3, 1))
+# 
+# # Time vs rows for each column count
+# cols_list <- unique(scale_df$Features)
+# colors <- c("steelblue", "coral", "seagreen")
+# 
+# plot(NULL, xlim = range(scale_df$Rows), ylim = range(scale_df$Time_Sec),
+#      xlab = "Rows", ylab = "Time (sec)", main = "Anonymization Time vs Rows")
+# for (i in seq_along(cols_list)) {
+#   sub <- scale_df[scale_df$Features == cols_list[i], ]
+#   lines(sub$Rows, sub$Time_Sec, col = colors[i], lwd = 2, type = "b", pch = 16)
+# }
+# legend("topleft", legend = paste(cols_list, "features"),
+#        col = colors, lwd = 2, pch = 16, cex = 0.8)
+# 
+# # Time vs features for each row count
+# rows_list <- unique(scale_df$Rows)
+# colors2 <- hcl.colors(length(rows_list), palette = "Dark 2")
+# 
+# plot(NULL, xlim = range(scale_df$Features), ylim = range(scale_df$Time_Sec),
+#      xlab = "Features", ylab = "Time (sec)",
+#      main = "Anonymization Time vs Features")
+# for (i in seq_along(rows_list)) {
+#   sub <- scale_df[scale_df$Rows == rows_list[i], ]
+#   lines(sub$Features, sub$Time_Sec, col = colors2[i], lwd = 2, type = "b", pch = 16)
+# }
+# legend("topleft", legend = paste(rows_list, "rows"),
+#        col = colors2, lwd = 2, pch = 16, cex = 0.8)
+```
+
+## Per-Dataset Summary
 
 ```{r summary}
 cat("Datasets:", length(dataset_names), "\n")
-cat("Models:   ranger, gbm, glmnet\n")
+cat("Models:   ranger, gbm, glmnet, lda/ridge\n")
 cat("Method:   cryptoencoder anonymization\n\n")
 
 for (ds_name in dataset_names) {
   df <- all_results[all_results$Dataset == ds_name, ]
-  metric <- df$Metric[1]
-  if (metric == "Accuracy") {
-    avg_drop <- mean(df$Original - df$Anonymized)
-    cat(sprintf("%s: average accuracy change = %+.4f\n", ds_name, -avg_drop))
+  task <- df$Task[1]
+  n_feat <- df$Features[1]
+  n_rows <- df$Rows[1]
+  cat(sprintf("--- %s (%d rows, %d features, %s) ---\n",
+              ds_name, n_rows, n_feat, task))
+
+  if (task == "classification") {
+    acc <- df[df$Metric == "Accuracy", ]
+    avg_drop <- mean(acc$Original - acc$Anonymized, na.rm = TRUE)
+    cat(sprintf("  Avg accuracy change: %+.4f\n", -avg_drop))
+
+    f1 <- df[df$Metric == "F1" & !is.na(df$Original), ]
+    if (nrow(f1) > 0) {
+      avg_f1_drop <- mean(f1$Original - f1$Anonymized, na.rm = TRUE)
+      cat(sprintf("  Avg F1 change:       %+.4f\n", -avg_f1_drop))
+    }
   } else {
-    avg_change <- mean(df$Anonymized - df$Original)
-    cat(sprintf("%s: average RMSE change = %+.4f\n", ds_name, avg_change))
+    rmse <- df[df$Metric == "RMSE", ]
+    avg_rmse_change <- mean(rmse$Anonymized - rmse$Original, na.rm = TRUE)
+    cat(sprintf("  Avg RMSE change: %+.4f\n", avg_rmse_change))
+
+    r2 <- df[df$Metric == "R2", ]
+    avg_r2_change <- mean(r2$Anonymized - r2$Original, na.rm = TRUE)
+    cat(sprintf("  Avg R² change:   %+.4f\n", avg_r2_change))
   }
+  cat("\n")
 }
 ```

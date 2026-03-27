@@ -84,6 +84,92 @@ anonymize_data <- function(data, key, columns = NULL, opts = list()) {
   )
 }
 
+#' Apply an existing anonymization mapping to new data
+#'
+#' Transforms new observations using the encoder trained during a previous
+#' call to [anonymize_data()].  Unlike [anonymize_data()], no autoencoder is
+#' retrained: the encrypted weights stored in \code{mapping} are decrypted and
+#' applied directly, so the new data lands in the same representation space as
+#' the original anonymized data.
+#'
+#' This is the correct pattern for production use: anonymize a training set
+#' with [anonymize_data()], then pass the returned \code{mapping} here to
+#' transform held-out or streaming data consistently.
+#'
+#' Only \code{method = "cryptoencoder"} mappings are supported.  For
+#' \code{method = "pca"} the key-derived rotation is already fully
+#' data-independent, so calling [anonymize_data()] directly on new data already
+#' produces a consistent representation.
+#'
+#' @param new_data A data.frame with the same feature columns that were
+#'   anonymized when \code{mapping} was created.
+#' @param key The same secret key used to create \code{mapping}.
+#' @param mapping The \code{mapping} list returned by [anonymize_data()].
+#' @return A data.frame with the same layout as \code{anonymize_data()$data}:
+#'   non-anonymized columns preserved, anonymized columns replaced by
+#'   \code{anon_1, ..., anon_n}.
+#' @export
+transform_new_data <- function(new_data, key, mapping) {
+  if (!is.data.frame(new_data)) stop("new_data must be a data.frame")
+  key <- normalize_key(key)
+
+  method <- mapping$method %||% "pca"
+  if (method == "pca") {
+    stop(
+      "transform_new_data() does not support method = \"pca\". ",
+      "For PCA, call anonymize_data() directly: the key-derived rotation ",
+      "is data-independent and already produces a consistent representation."
+    )
+  }
+
+  columns <- mapping$columns
+  missing_cols <- setdiff(columns, names(new_data))
+  if (length(missing_cols) > 0L) {
+    stop("new_data is missing columns that were anonymized: ",
+         paste(missing_cols, collapse = ", "))
+  }
+
+  # Encode each column to numeric, reusing the original label ordering for
+  # categorical columns so category codes are consistent with training data.
+  enc_mat <- matrix(NA_real_, nrow = nrow(new_data), ncol = length(columns))
+  colnames(enc_mat) <- columns
+  for (i in seq_along(columns)) {
+    enc_mat[, i] <- encode_column_with_meta(
+      new_data[[columns[i]]], mapping$col_encodings[[columns[i]]]
+    )
+  }
+
+  # Re-derive key-based center/scale (never stored; same derivation as original).
+  cs <- derive_center_scale(key, columns)
+  mat_cs <- sweep(enc_mat, 2, cs$center, `-`)
+  mat_cs <- sweep(mat_cs, 2, cs$scale, `/`)
+
+  # Decrypt the trained autoencoder weights from the mapping.
+  dec <- decrypt_ae_weights(mapping$pca$encrypted_weights, key)
+
+  # Normalize using the training data's statistics (stored in encrypted weights).
+  x_norm <- sweep(mat_cs, 2, dec$data_center, `-`)
+  x_norm <- sweep(x_norm, 2, dec$data_scale, `/`)
+
+  # Encoder forward pass: hidden = tanh(x_norm %*% W_enc + b_enc).
+  N <- nrow(x_norm)
+  n <- ncol(x_norm)
+  h_pre  <- x_norm %*% dec$weights$W_enc +
+    matrix(dec$weights$b_enc, nrow = N, ncol = n, byrow = TRUE)
+  hidden <- tanh(h_pre)
+
+  # Key-derived post-rotation (same label as used during anonymization).
+  Q_post <- generate_key_rotation(key, n, label = "post-encoder-rotation")
+  hidden_rotated <- hidden %*% Q_post
+
+  # Assemble output: non-anonymized columns + anon_* columns.
+  out <- new_data[, mapping$non_anon_cols, drop = FALSE]
+  for (i in seq_along(mapping$anon_names)) {
+    out[[mapping$anon_names[i]]] <- hidden_rotated[, i]
+  }
+  out
+}
+
 #' Deanonymize a data frame using key and mapping
 #'
 #' Reverses the anonymization produced by `anonymize_data()`. The secret key

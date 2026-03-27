@@ -244,11 +244,14 @@ prepare_dataset <- function(name) {
   }
 }
 
-#' Anonymize feature columns with cryptoencoder.
-anonymize_features <- function(features, key) {
-  res <- anonymize_data(features, key,
-                        opts = list(method = "cryptoencoder"))
-  res$data
+#' Anonymize training features and return both data and mapping.
+anonymize_train <- function(features, key) {
+  anonymize_data(features, key, opts = list(method = "cryptoencoder"))
+}
+
+#' Apply an existing mapping to test features (no retraining).
+anonymize_test <- function(features, key, mapping) {
+  transform_new_data(features, key, mapping)
 }
 
 #' Compute classification metrics.
@@ -447,15 +450,13 @@ for (ds_name in dataset_names) {
   y_train <- y[train_idx]
   y_test  <- y[test_idx]
 
-  # Anonymize train and test together so both sets pass through the same
-  # trained autoencoder (consistent hidden representation space).
-  # Target is held in y_train/y_test and never seen by the autoencoder.
+  # Train the autoencoder on X_train only (target is in y_train, never seen
+  # by the encoder). Then apply the same trained weights to X_test via the
+  # mapping, so both sets share an identical representation space.
   t0 <- proc.time()
-  n_train <- nrow(X_train)
-  X_all   <- rbind(X_train, X_test)
-  anon_all  <- anonymize_features(X_all, key)
-  anon_train <- anon_all[seq_len(n_train), , drop = FALSE]
-  anon_test  <- anon_all[seq_len(nrow(X_test)) + n_train, , drop = FALSE]
+  res_train  <- anonymize_train(X_train, key)
+  anon_train <- res_train$data
+  anon_test  <- anonymize_test(X_test, key, res_train$mapping)
   t_anon <- (proc.time() - t0)[["elapsed"]]
 
   timing[[ds_name]] <- data.frame(

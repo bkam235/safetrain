@@ -369,6 +369,31 @@ decode_column <- function(num_vec, enc) {
   out
 }
 
+#' Encode a column to numeric using existing encoding metadata
+#'
+#' Like encode_column() but reuses the label ordering captured during the
+#' original anonymization call, so categorical codes are consistent when
+#' transforming new data.
+#'
+#' @param x Column vector from new data.
+#' @param orig_enc Encoding metadata from mapping$col_encodings[[col]].
+#' @return Numeric vector.
+#' @noRd
+encode_column_with_meta <- function(x, orig_enc) {
+  switch(orig_enc$type,
+    numeric  = as.numeric(x),
+    integer  = as.numeric(x),
+    date     = as.numeric(x),
+    datetime = as.numeric(x),
+    {  # factor or categorical: map against the original label set
+      x_char <- as.character(x)
+      codes  <- as.numeric(match(x_char, orig_enc$labels) - 1L)
+      codes[is.na(x_char)] <- NA_real_
+      codes
+    }
+  )
+}
+
 #' Infer column type for transform selection
 #' @param x Column vector.
 #' @return One of "numeric", "categorical", "date", "datetime".

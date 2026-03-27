@@ -447,10 +447,15 @@ for (ds_name in dataset_names) {
   y_train <- y[train_idx]
   y_test  <- y[test_idx]
 
-  # Time the anonymization step
+  # Anonymize train and test together so both sets pass through the same
+  # trained autoencoder (consistent hidden representation space).
+  # Target is held in y_train/y_test and never seen by the autoencoder.
   t0 <- proc.time()
-  anon_train <- anonymize_features(X_train, key)
-  anon_test  <- anonymize_features(X_test, key)
+  n_train <- nrow(X_train)
+  X_all   <- rbind(X_train, X_test)
+  anon_all  <- anonymize_features(X_all, key)
+  anon_train <- anon_all[seq_len(n_train), , drop = FALSE]
+  anon_test  <- anon_all[seq_len(nrow(X_test)) + n_train, , drop = FALSE]
   t_anon <- (proc.time() - t0)[["elapsed"]]
 
   timing[[ds_name]] <- data.frame(

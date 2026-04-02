@@ -94,6 +94,18 @@ res$data    # all values in (-1, 1), every column mixes all inputs
 # Reverse with the same key
 recovered <- deanonymize_data(res$data, key, res$mapping)
 all.equal(recovered, sample_data)  # TRUE (within tolerance)
+
+# --- Differential privacy: add (epsilon, delta)-DP Gaussian noise ---
+res_dp <- anonymize_data(sample_data, key,
+                         opts = list(method = "cryptoencoder",
+                                     dp_epsilon = 1.0,
+                                     dp_delta   = 1e-5))
+res_dp$mapping$pca$dp_sigma  # noise level applied, stored for audit
+
+# --- Key destruction: convert pseudonymization to de facto anonymization ---
+# The key is zeroed inside the function; recovery becomes permanently impossible.
+res_anon <- anonymize_data(sample_data, key, destroy_key = TRUE)
+# deanonymize_data(res_anon$data, key, res_anon$mapping)  # would error
 ```
 
 You can use a passphrase instead of a random key:
@@ -114,8 +126,9 @@ res <- anonymize_data(data, key, columns = c("amount", "count"))
 |---|---|
 | `generate_key(bytes = 32)` | Generate a random 256-bit key (raw vector) |
 | `key_from_passphrase(passphrase)` | Derive a deterministic key from a passphrase (SHA-256) |
-| `anonymize_data(data, key, columns, opts)` | Anonymize a data frame. Returns `list(data, mapping)` |
+| `anonymize_data(data, key, columns, opts, destroy_key)` | Anonymize a data frame. Returns `list(data, mapping)` |
 | `deanonymize_data(data_anon, key, mapping)` | Reverse anonymization. Returns the original data frame |
+| `transform_new_data(new_data, key, mapping)` | Apply an existing cryptoencoder mapping to new observations |
 
 ### Options for `anonymize_data()`
 
@@ -127,6 +140,12 @@ Pass a named list as `opts`:
 | `ae_max_epochs` | 5000 | Max training epochs (cryptoencoder only) |
 | `ae_tol` | 1e-10 | Early-stopping loss threshold (cryptoencoder only) |
 | `ae_lr` | 0.01 | Initial learning rate (cryptoencoder only) |
+| `dp_epsilon` | `NULL` | Positive number. Adds (ε, δ)-DP Gaussian noise after encoding (cryptoencoder only). Smaller = stronger privacy, more noise. |
+| `dp_delta` | `1e-5` | Delta parameter for DP. Ignored when `dp_epsilon` is `NULL`. Typical choice: `1 / nrow(data)`. |
+
+### `destroy_key` parameter
+
+`anonymize_data(..., destroy_key = TRUE)` zeros the key inside the function after anonymization and sets `mapping$key_destroyed = TRUE`. Any subsequent call to `deanonymize_data()` or `transform_new_data()` with that mapping will error. This converts the scheme from **GDPR pseudonymization** (Art. 4(5), data is still personal) to **de facto anonymization** (Recital 26, data can no longer be attributed to an individual). Use when auditability is not required. Note: R's GC cannot guarantee memory erasure — the caller must also discard their own copy of the key.
 
 ## Choosing a method
 
@@ -137,8 +156,19 @@ Pass a named list as `opts`:
 | Column mixing | Linear (rotation) | Nonlinear (tanh) |
 | Speed | Instant | Trains per dataset |
 | Column/cell traceability | Not 1-to-1 (rotation) | Guaranteed no correspondence |
+| Differential privacy | Not supported | `dp_epsilon` + `dp_delta` |
+| Key destruction | Supported | Supported |
 
-Use **PCA** when you need exact recovery and speed. Use **cryptoencoder** when you need the same column count, stronger anonymization guarantees, or better preservation of ML signal (no column is dropped).
+Use **PCA** when you need exact recovery and speed. Use **cryptoencoder** when you need the same column count, stronger anonymization guarantees, DP noise, or better preservation of ML signal (no column is dropped).
+
+## GDPR compliance modes
+
+| `destroy_key` | `dp_epsilon` | GDPR status | Auditability |
+|---|---|---|---|
+| `FALSE` (default) | `NULL` | Pseudonymization (Art. 4(5)) | Full recovery with key |
+| `FALSE` | set | Pseudonymization + formal (ε,δ)-DP | Full recovery (noisy) |
+| `TRUE` | `NULL` | De facto anonymization (Recital 26) | None |
+| `TRUE` | set | De facto anonymization + (ε,δ)-DP | None |
 
 ## Vignette
 

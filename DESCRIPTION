@@ -1,12 +1,19 @@
 Package: safetrain
-Title: Reversible, ML-Safe Anonymization
-Description: Key-based reversible anonymization of tabular data using a
-  cryptographic key-derived orthogonal rotation (HMAC-PRNG + QR decomposition).
-  All columns are encoded to numeric and transformed jointly; the rotation
-  matrix and centering/scaling are derived from the secret key and never stored,
-  so reversal requires the key. When two or more columns are anonymized, one
-  column is dropped and encrypted, producing a reduced output.
-Version: 0.1.0
+Title: Reversible, ML-Safe Anonymization for Tabular Data
+Description: Key-based anonymization of tabular data designed for GDPR-compliant
+  machine learning workflows. Two transformation methods are provided: a PCA
+  method (key-derived orthogonal rotation via HMAC-PRNG + QR decomposition,
+  output has n-1 columns) and a cryptoencoder method (shallow n-to-n autoencoder
+  with key-derived weight initialization and a key-derived orthogonal
+  post-rotation, output has n columns with formal no-correspondence guarantees).
+  All transformation parameters are derived from the secret key and never stored
+  in plain text, so reversal requires both the key and the mapping. An optional
+  (epsilon, delta)-differential privacy layer adds calibrated Gaussian noise to
+  the cryptoencoder output, exploiting the bounded tanh output range for clean
+  sensitivity analysis. A key-destruction mode permanently prevents recovery,
+  converting the scheme from GDPR pseudonymization (Article 4(5)) to de facto
+  anonymization (Recital 26) for use cases where auditability is not required.
+Version: 0.2.0
 Authors@R: person("Author", role = c("aut", "cre"), email = "author@example.com")
 License: MIT + file LICENSE
 Encoding: UTF-8

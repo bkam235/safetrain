@@ -65,36 +65,53 @@ res2 <- anonymize_data(sample_data, key, columns = c("user_id", "region"))
 identical(res2$data$product, sample_data$product)
 ```
 
-## Model performance on deanonymized data
+## Model performance on anonymized data
 
-Because deanonymization exactly recovers the original data, a model trained
-on deanonymized data achieves identical performance to one trained on the
-original. This verifies the round-trip fidelity.
+The cryptoencoder method allows models to be trained directly on the
+anonymized representation. The encoder is fit on the training split only;
+the same trained weights (stored encrypted in the mapping) are then applied
+to the test split via `transform_new_data()`, so both splits share the same
+representation space without any leakage.
 
 ```{r model-perf, eval = requireNamespace("ranger", quietly = TRUE)}
 if (requireNamespace("ranger", quietly = TRUE)) {
   set.seed(42)
-  n <- nrow(sample_data)
+  n   <- nrow(sample_data)
   idx <- sample(n, floor(0.7 * n))
-  train_orig <- sample_data[idx, ]
-  test_orig <- sample_data[-idx, ]
+
+  # Feature/target split (target is never anonymized)
+  features <- c("region", "product", "count")
+  target   <- "amount"
+
+  X_train <- sample_data[idx,  features, drop = FALSE]
+  X_test  <- sample_data[-idx, features, drop = FALSE]
+  y_train <- sample_data[idx,  target]
+  y_test  <- sample_data[-idx, target]
 
   key <- generate_key()
-  anon <- anonymize_data(train_orig, key)
-  train_recovered <- deanonymize_data(anon$data, key, anon$mapping)
 
-  m_orig <- ranger::ranger(amount ~ region + product + count, data = train_orig)
-  m_recovered <- ranger::ranger(amount ~ region + product + count, data = train_recovered)
+  # --- Original ---
+  train_orig        <- X_train; train_orig[[target]] <- y_train
+  test_orig         <- X_test;  test_orig[[target]]  <- y_test
+  m_orig            <- ranger::ranger(amount ~ ., data = train_orig)
+  pred_orig         <- predict(m_orig, test_orig)$predictions
+  rmse_orig         <- sqrt(mean((pred_orig - y_test)^2))
 
-  pred_orig <- predict(m_orig, test_orig)$predictions
-  pred_recovered <- predict(m_recovered, test_orig)$predictions
+  # --- Anonymized (cryptoencoder): fit on train, apply to test ---
+  res_train         <- anonymize_data(X_train, key,
+                                     opts = list(method = "cryptoencoder"))
+  anon_train        <- res_train$data; anon_train[[target]] <- y_train
 
-  rmse_orig <- sqrt(mean((pred_orig - test_orig$amount)^2))
-  rmse_recovered <- sqrt(mean((pred_recovered - test_orig$amount)^2))
+  anon_test         <- transform_new_data(X_test, key, res_train$mapping)
+  anon_test[[target]] <- y_test
 
-  cat("RMSE (original): ", round(rmse_orig, 6), "\n")
-  cat("RMSE (deanonymized): ", round(rmse_recovered, 6), "\n")
-  cat("Difference: ", abs(rmse_orig - rmse_recovered), "\n")
+  m_anon            <- ranger::ranger(amount ~ ., data = anon_train)
+  pred_anon         <- predict(m_anon, anon_test)$predictions
+  rmse_anon         <- sqrt(mean((pred_anon - y_test)^2))
+
+  cat("RMSE (original features):   ", round(rmse_orig, 4), "\n")
+  cat("RMSE (anonymized features): ", round(rmse_anon, 4), "\n")
+  cat("Difference:                 ", round(abs(rmse_orig - rmse_anon), 4), "\n")
 }
 ```
 
@@ -102,9 +119,82 @@ if (requireNamespace("ranger", quietly = TRUE)) {
 # Install the ranger package to run the model performance comparison.
 ```
 
+## Differential privacy
+
+The cryptoencoder output is bounded in (−1, 1) per column due to tanh. This
+makes Gaussian noise calibration unusually clean: the global L2 sensitivity of
+any single row is `2 * sqrt(n)`, where n is the number of columns. Pass
+`dp_epsilon` (and optionally `dp_delta`, default `1e-5`) to add
+(ε, δ)-differentially private noise after the post-rotation step.
+
+```{r dp-example}
+key_dp <- generate_key()
+data(sample_data)
+X <- sample_data[, c("amount", "count", "user_id")]
+
+res_dp <- anonymize_data(X, key_dp,
+                         opts = list(method = "cryptoencoder",
+                                     dp_epsilon = 1.0,
+                                     dp_delta   = 1e-5))
+
+cat("Noise sigma applied: ", round(res_dp$mapping$pca$dp_sigma, 4), "\n")
+cat("DP guarantee:        (epsilon =", res_dp$mapping$pca$dp_epsilon,
+    ", delta =", res_dp$mapping$pca$dp_delta, ")\n")
+```
+
+Smaller `dp_epsilon` means stronger privacy and more noise. A common choice for
+`dp_delta` is `1 / nrow(data)`. The noise level is stored in the mapping for
+audit purposes.
+
+Note: the (ε, δ)-DP guarantee applies to the **encoding step with fixed
+pre-trained weights** — i.e. when using `transform_new_data()` to encode new
+individuals through an already-trained encoder. It does not cover the
+autoencoder training phase itself. Organisations requiring full-pipeline
+differential privacy should apply DP-SGD during training.
+
+## Key destruction and GDPR anonymization
+
+By default, `anonymize_data()` returns a mapping that allows full recovery with
+the key — this is **pseudonymization** under GDPR Article 4(5), and the data
+remains personal data. Set `destroy_key = TRUE` when auditability is not
+required: the key is zeroed inside the function and the mapping is permanently
+locked, converting the scheme to **de facto anonymization** under GDPR
+Recital 26.
+
+```{r destroy-key}
+key_anon <- generate_key()
+data(sample_data)
+
+res_anon <- anonymize_data(sample_data, key_anon, destroy_key = TRUE)
+
+# The mapping records that destruction occurred
+cat("Key destroyed: ", res_anon$mapping$key_destroyed, "\n")
+
+# Attempting recovery now errors immediately
+tryCatch(
+  deanonymize_data(res_anon$data, key_anon, res_anon$mapping),
+  error = function(e) cat("Recovery blocked:", conditionMessage(e), "\n")
+)
+```
+
+The table below summarises the GDPR compliance modes:
+
+| `destroy_key` | `dp_epsilon` | GDPR status | Auditability |
+|---|---|---|---|
+| `FALSE` (default) | `NULL` | Pseudonymization (Art. 4(5)) | Full recovery with key |
+| `FALSE` | set | Pseudonymization + formal (ε,δ)-DP | Full recovery (noisy) |
+| `TRUE` | `NULL` | De facto anonymization (Recital 26) | None |
+| `TRUE` | set | De facto anonymization + (ε,δ)-DP | None |
+
 ## Summary
 
 - Use `generate_key()` or `key_from_passphrase()` to get a secret key.
-- Use `anonymize_data(data, key)` to get anonymized data and a mapping; store both the key and the mapping if you need to reverse later.
+- Use `anonymize_data(data, key)` to get anonymized data and a mapping; store
+  both the key and the mapping if you need to reverse later.
 - Use `deanonymize_data(anon_data, key, mapping)` to recover the original data.
-- The anonymization is cryptographically key-dependent: without the key, the rotation cannot be re-derived and the dropped column cannot be decrypted.
+- Use `transform_new_data(new_data, key, mapping)` to encode new observations
+  through an already-trained cryptoencoder without retraining.
+- Set `opts$dp_epsilon` to add (ε, δ)-differential privacy noise
+  (cryptoencoder only).
+- Set `destroy_key = TRUE` to permanently prevent recovery, converting
+  pseudonymization to de facto anonymization under GDPR Recital 26.

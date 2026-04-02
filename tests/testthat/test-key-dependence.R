@@ -38,3 +38,51 @@ test_that("mapping alone is insufficient for reversal", {
   # encrypted_dropped is raw bytes, not the plain values
   expect_type(res$mapping$pca$encrypted_dropped, "raw")
 })
+
+test_that("destroy_key sets mapping$key_destroyed", {
+  key <- generate_key()
+  data(sample_data)
+  res <- anonymize_data(sample_data, key, destroy_key = TRUE)
+  expect_true(isTRUE(res$mapping$key_destroyed))
+})
+
+test_that("deanonymize_data errors when key was destroyed", {
+  key <- generate_key()
+  data(sample_data)
+  res <- anonymize_data(sample_data, key, destroy_key = TRUE)
+  expect_error(
+    deanonymize_data(res$data, key, res$mapping),
+    "key was destroyed"
+  )
+})
+
+test_that("transform_new_data errors when key was destroyed", {
+  key <- generate_key()
+  data(sample_data)
+  X <- sample_data[, c("amount", "count")]
+  res <- anonymize_data(X, key,
+                        opts = list(method = "cryptoencoder"),
+                        destroy_key = TRUE)
+  expect_error(
+    transform_new_data(X, key, res$mapping),
+    "key was destroyed"
+  )
+})
+
+test_that("destroy_key = FALSE (default) preserves normal behaviour", {
+  key <- generate_key()
+  data(sample_data)
+  res <- anonymize_data(sample_data, key)
+  expect_null(res$mapping$key_destroyed)
+  recovered <- deanonymize_data(res$data, key, res$mapping)
+  expect_equal(recovered$amount, sample_data$amount, tolerance = 1e-6)
+})
+
+test_that("invalid destroy_key value raises error", {
+  key <- generate_key()
+  data(sample_data)
+  expect_error(
+    anonymize_data(sample_data, key, destroy_key = "yes"),
+    "destroy_key must be TRUE or FALSE"
+  )
+})

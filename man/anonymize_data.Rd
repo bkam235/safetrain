@@ -4,7 +4,7 @@
 \alias{anonymize_data}
 \title{Anonymize a data frame with key-based reversible transforms}
 \usage{
-anonymize_data(data, key, columns = NULL, opts = list())
+anonymize_data(data, key, columns = NULL, opts = list(), destroy_key = FALSE)
 }
 \arguments{
 \item{data}{A data.frame.}
@@ -26,7 +26,30 @@ anonymize all columns.}
 (default 1e-10). Ignored for \code{"pca"}.}
 \item{ae_lr}{Learning rate for cryptoencoder training (default 0.01).
 Ignored for \code{"pca"}.}
+\item{dp_epsilon}{Positive numeric or \code{NULL} (default \code{NULL}).
+When set, Gaussian noise calibrated to (\code{dp_epsilon},
+\code{dp_delta})-differential privacy is added to the cryptoencoder
+output after the post-rotation step. Only supported for
+\code{method = "cryptoencoder"}. The global L2 sensitivity is
+\code{2 * sqrt(n)} where n is the number of output columns, derived
+from the bounded tanh output range (each column in (-1, 1)) and the
+norm-preserving post-rotation. Smaller epsilon means stronger privacy
+and more noise. Recovery via \code{deanonymize_data()} remains
+possible but will not reproduce the original values exactly.}
+\item{dp_delta}{Numeric in (0, 1), default \code{1e-5}. The delta
+parameter for (\code{dp_epsilon}, \code{dp_delta})-DP. Ignored when
+\code{dp_epsilon} is \code{NULL}. A common choice is \code{1 / nrow(data)}.}
 }}
+
+\item{destroy_key}{Logical (default \code{FALSE}). If \code{TRUE}, the key
+is overwritten with zero bytes inside the function after anonymization
+completes and \code{mapping$key_destroyed} is set to \code{TRUE}. Any
+subsequent call to \code{\link{deanonymize_data}()} or
+\code{\link{transform_new_data}()} with this mapping will fail with an
+error. Use when auditability is not required and GDPR de facto
+anonymization (Recital 26) is the goal. Note: R's garbage collector
+cannot guarantee memory erasure; the caller must also discard or
+overwrite their own key variable.}
 }
 \value{
 List with \code{data} (anonymized data.frame) and \code{mapping} (metadata
